@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using MCPForUnity.Editor.Helpers;
+using MCPForUnity.Runtime;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEngine;
@@ -11,52 +12,60 @@ namespace MCPForUnity.Editor.Tools
 {
     /// <summary>
     /// Tool for simulating UI interactions in Unity Game view during Play Mode.
-    /// Supports listing and interacting with Button, InputField, Toggle, Slider, and Dropdown elements.
+    /// Uses the runtime UIInputSimulator queue pattern so that ExecuteEvents calls
+    /// happen inside the game Update loop where they actually work.
     /// </summary>
     [McpForUnityTool("simulate_ui", Group = "ui")]
     public static class SimulateUI
     {
+        private const string AllActions =
+            "list_buttons, click, list_inputs, set_input, list_toggles, set_toggle, " +
+            "list_sliders, set_slider, list_dropdowns, set_dropdown, " +
+            "mouse_click, mouse_down, mouse_up, mouse_move, mouse_drag, mouse_scroll, " +
+            "key_down, key_up, key_press, text_input";
+
         public static object HandleCommand(JObject @params)
         {
             if (@params == null)
-            {
                 return new ErrorResponse("Parameters cannot be null.");
-            }
 
             if (!EditorApplication.isPlaying)
-            {
                 return new ErrorResponse("simulate_ui requires Play Mode. Enter Play Mode first.");
-            }
 
             string action = ParamCoercion.CoerceString(@params["action"], null)?.ToLowerInvariant();
             if (string.IsNullOrEmpty(action))
-            {
-                return new ErrorResponse(
-                    "'action' parameter is required. Valid actions: list_buttons, click, " +
-                    "list_inputs, set_input, list_toggles, set_toggle, list_sliders, set_slider, " +
-                    "list_dropdowns, set_dropdown");
-            }
+                return new ErrorResponse("'action' parameter is required. Valid actions: " + AllActions);
 
             try
             {
-                switch (action)
+                return action switch
                 {
-                    case "list_buttons": return ListButtons();
-                    case "click": return ClickButton(@params);
-                    case "list_inputs": return ListInputs();
-                    case "set_input": return SetInput(@params);
-                    case "list_toggles": return ListToggles();
-                    case "set_toggle": return SetToggle(@params);
-                    case "list_sliders": return ListSliders();
-                    case "set_slider": return SetSlider(@params);
-                    case "list_dropdowns": return ListDropdowns();
-                    case "set_dropdown": return SetDropdown(@params);
-                    default:
-                        return new ErrorResponse(
-                            "Unknown action: '" + action + "'. Valid actions: list_buttons, click, " +
-                            "list_inputs, set_input, list_toggles, set_toggle, list_sliders, set_slider, " +
-                            "list_dropdowns, set_dropdown");
-                }
+                    // Read-only list actions (work fine from editor code)
+                    "list_buttons" => ListButtons(),
+                    "list_inputs" => ListInputs(),
+                    "list_toggles" => ListToggles(),
+                    "list_sliders" => ListSliders(),
+                    "list_dropdowns" => ListDropdowns(),
+                    // UI interaction actions (enqueued via UIInputSimulator)
+                    "click" => EnqueueClick(@params),
+                    "set_input" => EnqueueSetInput(@params),
+                    "set_toggle" => EnqueueSetToggle(@params),
+                    "set_slider" => EnqueueSetSlider(@params),
+                    "set_dropdown" => EnqueueSetDropdown(@params),
+                    // Mouse actions
+                    "mouse_click" => EnqueueMouseClick(@params),
+                    "mouse_down" => EnqueueMouseDown(@params),
+                    "mouse_up" => EnqueueMouseUp(@params),
+                    "mouse_move" => EnqueueMouseMove(@params),
+                    "mouse_drag" => EnqueueMouseDrag(@params),
+                    "mouse_scroll" => EnqueueMouseScroll(@params),
+                    // Keyboard actions
+                    "key_down" => EnqueueKeyDown(@params),
+                    "key_up" => EnqueueKeyUp(@params),
+                    "key_press" => EnqueueKeyPress(@params),
+                    "text_input" => EnqueueTextInput(@params),
+                    _ => new ErrorResponse("Unknown action: '" + action + "'. Valid actions: " + AllActions)
+                };
             }
             catch (Exception e)
             {
@@ -65,7 +74,7 @@ namespace MCPForUnity.Editor.Tools
             }
         }
 
-        #region List Actions
+        #region List Actions (read-only, direct execution)
 
         private static object ListButtons()
         {
@@ -76,11 +85,30 @@ namespace MCPForUnity.Editor.Tools
             {
                 if (btn == null || !btn.gameObject.activeInHierarchy) continue;
 
+                string label = "";
+                var textComp = btn.GetComponentInChildren<Text>();
+                if (textComp != null)
+                {
+                    label = textComp.text;
+                }
+                else
+                {
+                    var tmpComp = btn.GetComponentInChildren<Component>()?.gameObject
+                        .GetComponentsInChildren<Component>()
+                        .FirstOrDefault(c => c != null && c.GetType().Name.Contains("TextMeshPro"));
+                    if (tmpComp != null)
+                    {
+                        var textProp = tmpComp.GetType().GetProperty("text");
+                        if (textProp != null)
+                            label = textProp.GetValue(tmpComp) as string ?? "";
+                    }
+                }
+
                 results.Add(new
                 {
                     name = btn.gameObject.name,
                     path = GetGameObjectPath(btn.gameObject),
-                    text = GetButtonText(btn),
+                    text = label,
                     interactable = btn.interactable,
                     instanceID = btn.gameObject.GetInstanceID()
                 });
@@ -134,9 +162,7 @@ namespace MCPForUnity.Editor.Tools
                 string label = "";
                 var labelComp = toggle.GetComponentInChildren<Text>();
                 if (labelComp != null && labelComp.gameObject != toggle.graphic?.gameObject)
-                {
                     label = labelComp.text;
-                }
 
                 results.Add(new
                 {
@@ -225,300 +251,290 @@ namespace MCPForUnity.Editor.Tools
 
         #endregion
 
-        #region Interaction Actions
+        #region Enqueued UI Interaction Actions
 
-        private static object ClickButton(JObject @params)
+        private static object EnqueueClick(JObject @params)
         {
             string targetText = ParamCoercion.CoerceString(@params["text"], null);
             string targetName = ParamCoercion.CoerceString(@params["name"], null);
+            float? x = ParamCoercion.CoerceFloatNullable(@params["x"]);
+            float? y = ParamCoercion.CoerceFloatNullable(@params["y"]);
+
+            if (x.HasValue && y.HasValue)
+            {
+                UIInputSimulator.EnqueueClickAtPosition(x.Value, y.Value);
+                return new
+                {
+                    success = true,
+                    message = "Click at position (" + x.Value + ", " + y.Value + ") enqueued. Will execute next frame."
+                };
+            }
 
             if (string.IsNullOrEmpty(targetText) && string.IsNullOrEmpty(targetName))
+                return new ErrorResponse("Either 'text' (fuzzy match), 'name' (exact match), or 'x'+'y' (position) is required.");
+
+            if (!string.IsNullOrEmpty(targetName))
             {
-                return new ErrorResponse("Either 'text' (fuzzy match on button label) or 'name' (exact GameObject name) is required.");
-            }
-
-            var buttons = UnityEngine.Object.FindObjectsByType<Button>(FindObjectsSortMode.None);
-            Button matched = null;
-
-            foreach (var btn in buttons)
-            {
-                if (btn == null || !btn.gameObject.activeInHierarchy) continue;
-
-                // Match by exact GameObject name first
-                if (!string.IsNullOrEmpty(targetName) && btn.gameObject.name == targetName)
+                UIInputSimulator.EnqueueClickByName(targetName);
+                return new
                 {
-                    matched = btn;
-                    break;
-                }
-
-                // Match by text content (fuzzy: contains, case-insensitive)
-                if (!string.IsNullOrEmpty(targetText))
-                {
-                    string label = GetButtonText(btn);
-                    if (!string.IsNullOrEmpty(label) &&
-                        label.IndexOf(targetText, StringComparison.OrdinalIgnoreCase) >= 0)
-                    {
-                        matched = btn;
-                        break;
-                    }
-                }
+                    success = true,
+                    message = "Click on button '" + targetName + "' enqueued. Will execute next frame."
+                };
             }
 
-            if (matched == null)
-            {
-                string searchDesc = !string.IsNullOrEmpty(targetName)
-                    ? "name=" + targetName
-                    : "text=" + targetText;
-                return new ErrorResponse("No active button found matching " + searchDesc + ".");
-            }
-
-            if (!matched.interactable)
-            {
-                return new ErrorResponse("Button '" + matched.gameObject.name + "' is not interactable.");
-            }
-
-            matched.onClick.Invoke();
-
+            UIInputSimulator.EnqueueClickByText(targetText);
             return new
             {
                 success = true,
-                message = "Clicked button '" + matched.gameObject.name + "'.",
-                data = new
-                {
-                    name = matched.gameObject.name,
-                    path = GetGameObjectPath(matched.gameObject),
-                    text = GetButtonText(matched)
-                }
+                message = "Click on button with text '" + targetText + "' enqueued. Will execute next frame."
             };
         }
 
-        private static object SetInput(JObject @params)
+        private static object EnqueueSetInput(JObject @params)
         {
             string targetName = ParamCoercion.CoerceString(@params["name"], null);
             string newText = ParamCoercion.CoerceString(@params["text"], null);
 
             if (string.IsNullOrEmpty(targetName))
-            {
                 return new ErrorResponse("'name' parameter is required (exact GameObject name of the InputField).");
-            }
             if (newText == null)
-            {
                 return new ErrorResponse("'text' parameter is required (the text to set).");
-            }
 
-            var inputs = UnityEngine.Object.FindObjectsByType<InputField>(FindObjectsSortMode.None);
-            InputField matched = null;
-
-            foreach (var input in inputs)
-            {
-                if (input == null || !input.gameObject.activeInHierarchy) continue;
-                if (input.gameObject.name == targetName)
-                {
-                    matched = input;
-                    break;
-                }
-            }
-
-            if (matched == null)
-            {
-                return new ErrorResponse("No active InputField found with name '" + targetName + "'.");
-            }
-
-            if (!matched.interactable)
-            {
-                return new ErrorResponse("InputField '" + targetName + "' is not interactable.");
-            }
-
-            matched.text = newText;
-            matched.onValueChanged.Invoke(newText);
-            matched.onEndEdit.Invoke(newText);
-
+            UIInputSimulator.EnqueueSetInput(targetName, newText);
             return new
             {
                 success = true,
-                message = "Set InputField '" + targetName + "' text to '" + newText + "'.",
-                data = new
-                {
-                    name = matched.gameObject.name,
-                    path = GetGameObjectPath(matched.gameObject),
-                    text = matched.text
-                }
+                message = "Set InputField '" + targetName + "' to '" + newText + "' enqueued. Will execute next frame."
             };
         }
 
-        private static object SetToggle(JObject @params)
+        private static object EnqueueSetToggle(JObject @params)
         {
             string targetName = ParamCoercion.CoerceString(@params["name"], null);
             bool? newValue = ParamCoercion.CoerceBoolNullable(@params["value"]);
 
             if (string.IsNullOrEmpty(targetName))
-            {
                 return new ErrorResponse("'name' parameter is required (exact GameObject name of the Toggle).");
-            }
             if (!newValue.HasValue)
-            {
                 return new ErrorResponse("'value' parameter is required (true or false).");
-            }
 
-            var toggles = UnityEngine.Object.FindObjectsByType<Toggle>(FindObjectsSortMode.None);
-            Toggle matched = null;
-
-            foreach (var toggle in toggles)
-            {
-                if (toggle == null || !toggle.gameObject.activeInHierarchy) continue;
-                if (toggle.gameObject.name == targetName)
-                {
-                    matched = toggle;
-                    break;
-                }
-            }
-
-            if (matched == null)
-            {
-                return new ErrorResponse("No active Toggle found with name '" + targetName + "'.");
-            }
-
-            if (!matched.interactable)
-            {
-                return new ErrorResponse("Toggle '" + targetName + "' is not interactable.");
-            }
-
-            matched.isOn = newValue.Value;
-
+            UIInputSimulator.EnqueueSetToggle(targetName, newValue.Value);
             return new
             {
                 success = true,
-                message = "Set Toggle '" + targetName + "' to " + newValue.Value + ".",
-                data = new
-                {
-                    name = matched.gameObject.name,
-                    path = GetGameObjectPath(matched.gameObject),
-                    isOn = matched.isOn
-                }
+                message = "Set Toggle '" + targetName + "' to " + newValue.Value + " enqueued. Will execute next frame."
             };
         }
 
-        private static object SetSlider(JObject @params)
+        private static object EnqueueSetSlider(JObject @params)
         {
             string targetName = ParamCoercion.CoerceString(@params["name"], null);
             float? newValue = ParamCoercion.CoerceFloatNullable(@params["value"]);
 
             if (string.IsNullOrEmpty(targetName))
-            {
                 return new ErrorResponse("'name' parameter is required (exact GameObject name of the Slider).");
-            }
             if (!newValue.HasValue)
-            {
                 return new ErrorResponse("'value' parameter is required (float value within min/max range).");
-            }
 
-            var sliders = UnityEngine.Object.FindObjectsByType<Slider>(FindObjectsSortMode.None);
-            Slider matched = null;
-
-            foreach (var slider in sliders)
-            {
-                if (slider == null || !slider.gameObject.activeInHierarchy) continue;
-                if (slider.gameObject.name == targetName)
-                {
-                    matched = slider;
-                    break;
-                }
-            }
-
-            if (matched == null)
-            {
-                return new ErrorResponse("No active Slider found with name '" + targetName + "'.");
-            }
-
-            if (!matched.interactable)
-            {
-                return new ErrorResponse("Slider '" + targetName + "' is not interactable.");
-            }
-
-            float clamped = Mathf.Clamp(newValue.Value, matched.minValue, matched.maxValue);
-            matched.value = clamped;
-
+            UIInputSimulator.EnqueueSetSlider(targetName, newValue.Value);
             return new
             {
                 success = true,
-                message = "Set Slider '" + targetName + "' to " + clamped + ".",
-                data = new
-                {
-                    name = matched.gameObject.name,
-                    path = GetGameObjectPath(matched.gameObject),
-                    value = matched.value,
-                    minValue = matched.minValue,
-                    maxValue = matched.maxValue
-                }
+                message = "Set Slider '" + targetName + "' to " + newValue.Value + " enqueued. Will execute next frame."
             };
         }
 
-        private static object SetDropdown(JObject @params)
+        private static object EnqueueSetDropdown(JObject @params)
         {
             string targetName = ParamCoercion.CoerceString(@params["name"], null);
             int? newIndex = ParamCoercion.CoerceIntNullable(@params["index"]);
 
             if (string.IsNullOrEmpty(targetName))
-            {
                 return new ErrorResponse("'name' parameter is required (exact GameObject name of the Dropdown).");
-            }
             if (!newIndex.HasValue)
-            {
                 return new ErrorResponse("'index' parameter is required (0-based option index).");
-            }
 
-            var dropdowns = UnityEngine.Object.FindObjectsByType<Dropdown>(FindObjectsSortMode.None);
-            Dropdown matched = null;
-
-            foreach (var dropdown in dropdowns)
-            {
-                if (dropdown == null || !dropdown.gameObject.activeInHierarchy) continue;
-                if (dropdown.gameObject.name == targetName)
-                {
-                    matched = dropdown;
-                    break;
-                }
-            }
-
-            if (matched == null)
-            {
-                return new ErrorResponse("No active Dropdown found with name '" + targetName + "'.");
-            }
-
-            if (!matched.interactable)
-            {
-                return new ErrorResponse("Dropdown '" + targetName + "' is not interactable.");
-            }
-
-            if (newIndex.Value < 0 || newIndex.Value >= matched.options.Count)
-            {
-                return new ErrorResponse(
-                    "Index " + newIndex.Value + " is out of range. Dropdown '" + targetName +
-                    "' has " + matched.options.Count + " options (0-" + (matched.options.Count - 1) + ").");
-            }
-
-            matched.value = newIndex.Value;
-            matched.onValueChanged.Invoke(newIndex.Value);
-
-            string selectedText = matched.options[newIndex.Value].text;
+            UIInputSimulator.EnqueueSetDropdown(targetName, newIndex.Value);
             return new
             {
                 success = true,
-                message = "Set Dropdown '" + targetName + "' to index " + newIndex.Value +
-                          " ('" + selectedText + "').",
-                data = new
-                {
-                    name = matched.gameObject.name,
-                    path = GetGameObjectPath(matched.gameObject),
-                    selectedIndex = matched.value,
-                    selectedText = matched.options[matched.value].text
-                }
+                message = "Set Dropdown '" + targetName + "' to index " + newIndex.Value + " enqueued. Will execute next frame."
             };
         }
 
         #endregion
 
+        #region Mouse Actions
+
+        private static object EnqueueMouseClick(JObject @params)
+        {
+            float? x = ParamCoercion.CoerceFloatNullable(@params["x"]);
+            float? y = ParamCoercion.CoerceFloatNullable(@params["y"]);
+            if (!x.HasValue || !y.HasValue)
+                return new ErrorResponse("'x' and 'y' screen coordinates are required.");
+
+            int button = ParamCoercion.CoerceInt(@params["button"], 0);
+            int clickCount = ParamCoercion.CoerceInt(@params["click_count"], 1);
+
+            UIInputSimulator.EnqueueMouseClick(x.Value, y.Value, button, clickCount);
+            return new
+            {
+                success = true,
+                message = "Mouse click at (" + x.Value + ", " + y.Value + ") enqueued (button=" + button + ", clicks=" + clickCount + ")."
+            };
+        }
+
+        private static object EnqueueMouseDown(JObject @params)
+        {
+            float? x = ParamCoercion.CoerceFloatNullable(@params["x"]);
+            float? y = ParamCoercion.CoerceFloatNullable(@params["y"]);
+            if (!x.HasValue || !y.HasValue)
+                return new ErrorResponse("'x' and 'y' screen coordinates are required.");
+
+            int button = ParamCoercion.CoerceInt(@params["button"], 0);
+
+            UIInputSimulator.EnqueueMouseDown(x.Value, y.Value, button);
+            return new
+            {
+                success = true,
+                message = "Mouse down at (" + x.Value + ", " + y.Value + ") enqueued (button=" + button + ")."
+            };
+        }
+
+        private static object EnqueueMouseUp(JObject @params)
+        {
+            float? x = ParamCoercion.CoerceFloatNullable(@params["x"]);
+            float? y = ParamCoercion.CoerceFloatNullable(@params["y"]);
+            if (!x.HasValue || !y.HasValue)
+                return new ErrorResponse("'x' and 'y' screen coordinates are required.");
+
+            int button = ParamCoercion.CoerceInt(@params["button"], 0);
+
+            UIInputSimulator.EnqueueMouseUp(x.Value, y.Value, button);
+            return new
+            {
+                success = true,
+                message = "Mouse up at (" + x.Value + ", " + y.Value + ") enqueued (button=" + button + ")."
+            };
+        }
+
+        private static object EnqueueMouseMove(JObject @params)
+        {
+            float? x = ParamCoercion.CoerceFloatNullable(@params["x"]);
+            float? y = ParamCoercion.CoerceFloatNullable(@params["y"]);
+            if (!x.HasValue || !y.HasValue)
+                return new ErrorResponse("'x' and 'y' screen coordinates are required.");
+
+            UIInputSimulator.EnqueueMouseMove(x.Value, y.Value);
+            return new
+            {
+                success = true,
+                message = "Mouse move to (" + x.Value + ", " + y.Value + ") enqueued."
+            };
+        }
+
+        private static object EnqueueMouseDrag(JObject @params)
+        {
+            float? fromX = ParamCoercion.CoerceFloatNullable(@params["from_x"]);
+            float? fromY = ParamCoercion.CoerceFloatNullable(@params["from_y"]);
+            float? toX = ParamCoercion.CoerceFloatNullable(@params["to_x"]);
+            float? toY = ParamCoercion.CoerceFloatNullable(@params["to_y"]);
+
+            if (!fromX.HasValue || !fromY.HasValue || !toX.HasValue || !toY.HasValue)
+                return new ErrorResponse("'from_x', 'from_y', 'to_x', 'to_y' are all required.");
+
+            UIInputSimulator.EnqueueMouseDrag(fromX.Value, fromY.Value, toX.Value, toY.Value);
+            return new
+            {
+                success = true,
+                message = "Mouse drag from (" + fromX.Value + ", " + fromY.Value + ") to (" + toX.Value + ", " + toY.Value + ") enqueued."
+            };
+        }
+
+        private static object EnqueueMouseScroll(JObject @params)
+        {
+            float? x = ParamCoercion.CoerceFloatNullable(@params["x"]);
+            float? y = ParamCoercion.CoerceFloatNullable(@params["y"]);
+            float? scrollDelta = ParamCoercion.CoerceFloatNullable(@params["scroll_delta"]);
+
+            if (!x.HasValue || !y.HasValue)
+                return new ErrorResponse("'x' and 'y' screen coordinates are required.");
+            if (!scrollDelta.HasValue)
+                return new ErrorResponse("'scroll_delta' is required (positive=up, negative=down).");
+
+            UIInputSimulator.EnqueueMouseScroll(x.Value, y.Value, scrollDelta.Value);
+            return new
+            {
+                success = true,
+                message = "Mouse scroll at (" + x.Value + ", " + y.Value + ") delta=" + scrollDelta.Value + " enqueued."
+            };
+        }
+
+        #endregion
+
+        #region Keyboard Actions
+
+        private static object EnqueueKeyDown(JObject @params)
+        {
+            string keyStr = ParamCoercion.CoerceString(@params["key"], null);
+            if (string.IsNullOrEmpty(keyStr))
+                return new ErrorResponse("'key' parameter is required (Unity KeyCode name, e.g. 'Return', 'Space', 'A').");
+
+            if (!TryParseKeyCode(keyStr, out KeyCode key))
+                return new ErrorResponse("Invalid KeyCode: '" + keyStr + "'. Use Unity KeyCode names.");
+
+            UIInputSimulator.EnqueueKeyDown(key);
+            return new { success = true, message = "Key down '" + key + "' enqueued." };
+        }
+
+        private static object EnqueueKeyUp(JObject @params)
+        {
+            string keyStr = ParamCoercion.CoerceString(@params["key"], null);
+            if (string.IsNullOrEmpty(keyStr))
+                return new ErrorResponse("'key' parameter is required (Unity KeyCode name).");
+
+            if (!TryParseKeyCode(keyStr, out KeyCode key))
+                return new ErrorResponse("Invalid KeyCode: '" + keyStr + "'.");
+
+            UIInputSimulator.EnqueueKeyUp(key);
+            return new { success = true, message = "Key up '" + key + "' enqueued." };
+        }
+
+        private static object EnqueueKeyPress(JObject @params)
+        {
+            string keyStr = ParamCoercion.CoerceString(@params["key"], null);
+            if (string.IsNullOrEmpty(keyStr))
+                return new ErrorResponse("'key' parameter is required (Unity KeyCode name).");
+
+            if (!TryParseKeyCode(keyStr, out KeyCode key))
+                return new ErrorResponse("Invalid KeyCode: '" + keyStr + "'.");
+
+            UIInputSimulator.EnqueueKeyPress(key);
+            return new { success = true, message = "Key press '" + key + "' enqueued (down + up)." };
+        }
+
+        private static object EnqueueTextInput(JObject @params)
+        {
+            string text = ParamCoercion.CoerceString(@params["text"], null);
+            if (string.IsNullOrEmpty(text))
+                return new ErrorResponse("'text' parameter is required (text to type into focused input).");
+
+            UIInputSimulator.EnqueueTextInput(text);
+            return new { success = true, message = "Text input '" + text + "' enqueued." };
+        }
+
+        #endregion
+
         #region Helpers
+
+        private static bool TryParseKeyCode(string keyStr, out KeyCode key)
+        {
+            if (Enum.TryParse<KeyCode>(keyStr, true, out key))
+                return true;
+            key = KeyCode.None;
+            return false;
+        }
 
         private static string GetGameObjectPath(GameObject go)
         {
@@ -530,25 +546,6 @@ namespace MCPForUnity.Editor.Tools
                 parent = parent.parent;
             }
             return path;
-        }
-
-        private static string GetButtonText(Button btn)
-        {
-            var textComp = btn.GetComponentInChildren<Text>();
-            if (textComp != null)
-                return textComp.text;
-
-            // Try TextMeshPro via reflection to avoid hard dependency
-            var components = btn.GetComponentsInChildren<Component>();
-            var tmpComp = components.FirstOrDefault(c => c != null && c.GetType().Name.Contains("TextMeshPro"));
-            if (tmpComp != null)
-            {
-                var textProp = tmpComp.GetType().GetProperty("text");
-                if (textProp != null)
-                    return textProp.GetValue(tmpComp) as string ?? "";
-            }
-
-            return "";
         }
 
         private static string GetPlaceholderText(InputField input)
