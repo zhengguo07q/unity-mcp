@@ -2,7 +2,8 @@
     "name": "MCPForUnity.Runtime",
     "rootNamespace": "MCPForUnity.Runtime",
     "references": [
-        "Newtonsoft.Json"
+        "Newtonsoft.Json",
+        "UnityEngine.UI"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],
@@ -13,4 +14,4 @@
     "defineConstraints": [],
     "versionDefines": [],
     "noEngineReferences": false
-} 
+}
